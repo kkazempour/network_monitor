@@ -28,6 +28,8 @@ Usage
   3. Press Ctrl+C to stop — summary is printed and CSV path is shown.
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import datetime
@@ -78,6 +80,12 @@ ALERT_AFTER_FAILURES: int = 3
 
 # Where to write output files.  "." means current working directory.
 OUTPUT_DIR: Path = Path(".")
+
+# Set to True to ping every target via BOTH WiFi and Ethernet simultaneously.
+# Each cycle produces two CSV rows per target — one per interface — so you
+# can directly compare whether a drop is wireless-only or affects both paths.
+# If only one interface is active the script falls back gracefully.
+MONITOR_ALL_INTERFACES: bool = True
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  CSV schema
@@ -222,26 +230,30 @@ def resolve_dns(hostname: str) -> tuple[str | None, float | None]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def ping_host(host: str) -> dict:
+def ping_host(host: str, source_ip: str = "") -> dict:
     """
     Run the system `ping` command and parse the results.
+    source_ip: if set, forces the ping out that specific interface via -S.
     Returns a dict with keys: min, avg, max, jitter, loss, status.
     """
     is_macos = platform.system() == "Darwin"
 
     if is_macos:
-        # -W timeout in milliseconds on macOS
         cmd = [
             "ping", "-c", str(PING_COUNT),
             "-W", str(PING_TIMEOUT_SECONDS * 1000),
-            host,
         ]
+        if source_ip:
+            cmd += ["-S", source_ip]
+        cmd.append(host)
     else:
-        # -W timeout in seconds on Linux
         cmd = [
             "ping", "-c", str(PING_COUNT),
             "-W", str(PING_TIMEOUT_SECONDS),
-            host,
         ]
+        if source_ip:
+            cmd += ["-I", source_ip]   # Linux uses -I for source interface/IP
+        cmd.append(host)
 
     try:
         proc = subprocess.run(
@@ -324,40 +336,57 @@ def http_check(target: str) -> tuple[str, float | None]:
 #  Active interface detection  (macOS)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def get_active_interface() -> str:
+# Each entry is (device, source_ip, label) e.g. ("en0", "192.168.1.5", "WiFi (en0)")
+InterfaceInfo = tuple[str, str, str]
+
+def get_active_interfaces() -> list[InterfaceInfo]:
     """
-    Return the type of the default-route interface on macOS.
-    Falls back to "unknown" on any error or non-macOS platform.
+    Return one entry per active network interface (WiFi + Ethernet).
+    Each entry is (device_name, source_ip, human_label).
+    Falls back to a single no-source entry on non-macOS or any error.
     """
     if platform.system() != "Darwin":
-        return "unknown"
-    try:
-        # Find the interface used for the default route
-        route = subprocess.run(
-            ["route", "-n", "get", "default"],
-            capture_output=True, text=True, timeout=3,
-        )
-        iface_m = re.search(r"interface:\s+(\S+)", route.stdout)
-        if not iface_m:
-            return "unknown"
-        iface = iface_m.group(1)          # e.g. "en0", "en1", "utun0"
+        return [("", "", "unknown")]
 
-        # Ask networksetup whether that interface is Wi-Fi or Ethernet
+    results: list[InterfaceInfo] = []
+    try:
         hw = subprocess.run(
-            ["networksetup", "-getmedia", iface],
-            capture_output=True, text=True, timeout=3,
+            ["networksetup", "-listallhardwareports"],
+            capture_output=True, text=True, timeout=5,
         )
-        combined = (hw.stdout + hw.stderr).lower()
-        if "wi-fi" in combined or "airport" in combined or "wireless" in combined:
-            return f"WiFi ({iface})"
-        if "ethernet" in combined or "1000base" in combined or "100base" in combined:
-            return f"Ethernet ({iface})"
-        # Fallback: check the interface name heuristic (en0 = Wi-Fi on most Macs)
-        if iface.startswith("en"):
-            return f"en-type ({iface})"
-        return f"other ({iface})"
+        # Each block is separated by a blank line
+        for block in hw.stdout.strip().split("\n\n"):
+            port, device = "", ""
+            for line in block.strip().splitlines():
+                if line.startswith("Hardware Port:"):
+                    port = line.split(":", 1)[1].strip()
+                elif line.startswith("Device:"):
+                    device = line.split(":", 1)[1].strip()
+
+            if not device:
+                continue
+            port_lower = port.lower()
+            if "wi-fi" in port_lower or "airport" in port_lower:
+                kind = "WiFi"
+            elif "ethernet" in port_lower or "thunderbolt" in port_lower:
+                kind = "Ethernet"
+            else:
+                continue  # skip Bluetooth, FireWire, etc.
+
+            # Only include if the interface actually has an IP right now
+            ip_proc = subprocess.run(
+                ["ipconfig", "getifaddr", device],
+                capture_output=True, text=True, timeout=3,
+            )
+            source_ip = ip_proc.stdout.strip()
+            if source_ip:
+                results.append((device, source_ip, f"{kind} ({device})"))
+
     except Exception:
-        return "unknown"
+        pass
+
+    # Fallback: single entry with no forced source (uses OS default route)
+    return results if results else [("", "", "unknown")]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -417,20 +446,27 @@ def append_csv(filepath: Path, row: dict) -> None:
 #  Summary report  (printed on exit)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def print_summary(states: dict[str, TargetState], csv_path: Path) -> None:
-    print("\n" + "━" * 60)
+def print_summary(
+    states: dict[tuple[str, str], TargetState],
+    ifaces: list[InterfaceInfo],
+    csv_path: Path,
+) -> None:
+    print("\n" + "━" * 62)
     print("  SUMMARY")
-    print("━" * 60)
-    for target, st in states.items():
-        if st.total_cycles == 0:
-            continue
-        uptime = (st.total_ok / st.total_cycles) * 100
-        icon = "✅" if uptime >= 99 else ("⚠️ " if uptime >= 80 else "❌")
-        print(f"  {icon}  {target:<22}  uptime={uptime:.1f}%  "
-              f"({st.total_ok}/{st.total_cycles} cycles ok)")
-    print("━" * 60)
+    print("━" * 62)
+    for _dev, _ip, iface_label in ifaces:
+        print(f"\n  {iface_label}")
+        for target in TARGETS:
+            st = states.get((target, iface_label))
+            if st is None or st.total_cycles == 0:
+                continue
+            uptime = (st.total_ok / st.total_cycles) * 100
+            icon = "✅" if uptime >= 99 else ("⚠️ " if uptime >= 80 else "❌")
+            print(f"    {icon}  {target:<22}  uptime={uptime:.1f}%  "
+                  f"({st.total_ok}/{st.total_cycles} cycles ok)")
+    print("\n" + "━" * 62)
     print(f"  📄  CSV saved to:  {csv_path.resolve()}")
-    print("━" * 60 + "\n")
+    print("━" * 62 + "\n")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -443,22 +479,37 @@ def run() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ts_start = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = OUTPUT_DIR / f"network_health_{ts_start}.csv"
-
-    states: dict[str, TargetState] = {t: TargetState(t) for t in TARGETS}
     init_csv(csv_path)
 
+    # ── Discover active interfaces ────────────────────────────────────────────
+    all_ifaces = get_active_interfaces()
+    ifaces = all_ifaces if MONITOR_ALL_INTERFACES else all_ifaces[:1]
+
+    # State is keyed by (target, iface_label) so WiFi and Ethernet are tracked
+    # independently — a WiFi drop won't pollute the Ethernet consecutive counter.
+    StateKey = tuple[str, str]
+    states:     dict[StateKey, TargetState]   = {}
+    hour_stats: dict[StateKey, HourlySummary] = {}
+    for target in TARGETS:
+        for _dev, _ip, iface_label in ifaces:
+            key = (target, iface_label)
+            states[key]     = TargetState(target)
+            hour_stats[key] = HourlySummary()
+
     mode_label = (
-        "verbose  (one line per cycle)"  if args.verbose else
-        "silent   (alerts + exit summary only)" if args.quiet  else
+        "verbose  (one line per cycle)"        if args.verbose else
+        "silent   (alerts + exit summary only)" if args.quiet   else
         "quiet    (hourly summary)"
     )
-    print(f"\n{'━'*60}")
+    iface_names = "  +  ".join(lbl for _, _, lbl in ifaces)
+    print(f"\n{'━'*62}")
     print(f"  🌐  Network Monitor  —  {len(TARGETS)} target(s)")
+    print(f"  🔌  Interfaces:  {iface_names}")
     print(f"  ⏱   Interval: {INTERVAL_SECONDS}s   Pings/cycle: {PING_COUNT}")
     print(f"  🖥   Output mode: {mode_label}")
     print(f"  📄  CSV: {csv_path.resolve()}")
     print(f"  Press Ctrl+C to stop")
-    print(f"{'━'*60}\n")
+    print(f"{'━'*62}\n")
 
     # ── Hourly summary state ──────────────────────────────────────────────────
 
@@ -466,7 +517,6 @@ def run() -> None:
         return datetime.datetime.now().strftime("%Y-%m-%d %H:00")
 
     active_hour = _hour_key()
-    hour_stats: dict[str, HourlySummary] = {t: HourlySummary() for t in TARGETS}
 
     def flush_hour(label: str) -> None:
         end_dt    = datetime.datetime.strptime(label, "%Y-%m-%d %H:00") + datetime.timedelta(hours=1)
@@ -474,17 +524,18 @@ def run() -> None:
         print(f"\n{'─'*72}")
         print(f"  HOURLY SUMMARY   {label} → {end_label}")
         print(f"{'─'*72}")
-        for t in TARGETS:
-            print(hour_stats[t].render(t))
+        for _dev, _ip, iface_label in ifaces:
+            print(f"\n  {iface_label}")
+            for t in TARGETS:
+                print(hour_stats[(t, iface_label)].render(t))
         print(f"{'─'*72}\n")
 
     # ── Signal handlers ───────────────────────────────────────────────────────
 
     def shutdown(sig, frame):  # noqa: ANN001
-        # In quiet/default mode, flush whatever partial hour we have on exit
         if not args.verbose and not args.quiet:
             flush_hour(active_hour)
-        print_summary(states, csv_path)
+        print_summary(states, ifaces, csv_path)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
@@ -494,84 +545,96 @@ def run() -> None:
 
     while True:
         cycle_start = time.monotonic()
-        ts    = datetime.datetime.now().isoformat(timespec="seconds")
-        iface = get_active_interface()  # sampled once per cycle
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
 
-        for target in TARGETS:
-            st = states[target]
-            st.total_cycles += 1
+        for iface_dev, source_ip, iface_label in ifaces:
+            # DNS is resolved once per target per cycle (same result for both ifaces)
+            dns_cache: dict[str, tuple[str | None, float | None]] = {}
 
-            # ── DNS ──────────────────────────────────────────────────────────
-            resolved_ip, dns_ms = resolve_dns(target)
-            ping_host_addr = resolved_ip or target
+            for target in TARGETS:
+                key = (target, iface_label)
+                st  = states[key]
+                st.total_cycles += 1
 
-            # ── ICMP ping ─────────────────────────────────────────────────────
-            ping = ping_host(ping_host_addr)
+                # ── DNS ───────────────────────────────────────────────────────
+                if target not in dns_cache:
+                    dns_cache[target] = resolve_dns(target)
+                resolved_ip, dns_ms = dns_cache[target]
+                ping_host_addr = resolved_ip or target
 
-            # ── HTTP check ───────────────────────────────────────────────────
-            http_code, http_ms = http_check(target)
+                # ── ICMP ping (forced via this interface) ─────────────────────
+                ping = ping_host(ping_host_addr, source_ip=source_ip)
 
-            # ── State update ─────────────────────────────────────────────────
-            success = ping["loss"] < 100.0
-            st.rolling.append(success)
-            rolling_loss = round(
-                (1 - sum(st.rolling) / len(st.rolling)) * 100, 1
-            )
+                # ── HTTP check (only on first interface to avoid duplicate hits)
+                if iface_dev == ifaces[0][0]:
+                    http_code, http_ms = http_check(target)
+                else:
+                    http_code, http_ms = "SKIP", None
 
-            if success:
-                st.total_ok += 1
-                st.consecutive_failures = 0
-            else:
-                st.consecutive_failures += 1
-                if st.consecutive_failures == ALERT_AFTER_FAILURES:
-                    notify(
-                        "⚠️ Network Drop",
-                        f"{target} has failed {ALERT_AFTER_FAILURES}× in a row",
-                    )
-                if not st.traceroute_done:
-                    st.traceroute_done = True
-                    run_traceroute(target, OUTPUT_DIR)
-
-            # ── Hourly accumulator ────────────────────────────────────────────
-            hour_stats[target].update(
-                success, ping["avg"], ping["max"], st.consecutive_failures, iface
-            )
-
-            # ── CSV row ───────────────────────────────────────────────────────
-            row: dict = {
-                "timestamp":            ts,
-                "target":               target,
-                "resolved_ip":          resolved_ip or "UNRESOLVED",
-                "dns_resolve_ms":       dns_ms if dns_ms is not None else "",
-                "ping_min_ms":          ping["min"] if ping["min"] is not None else "",
-                "ping_avg_ms":          ping["avg"] if ping["avg"] is not None else "",
-                "ping_max_ms":          ping["max"] if ping["max"] is not None else "",
-                "ping_jitter_ms":       ping["jitter"] if ping["jitter"] is not None else "",
-                "packet_loss_pct":      ping["loss"],
-                "rolling_loss_pct":     rolling_loss,
-                "consecutive_failures": st.consecutive_failures,
-                "ping_status":          ping["status"],
-                "http_status_code":     http_code,
-                "http_latency_ms":      http_ms if http_ms is not None else "",
-                "interface":            iface,
-            }
-            append_csv(csv_path, row)
-
-            # ── Verbose console output ────────────────────────────────────────
-            if args.verbose:
-                icon = "✅" if success else "❌"
-                lat  = f"{ping['avg']}ms" if ping["avg"] else "     —"
-                jit  = f"jitter={ping['jitter']}ms" if ping["jitter"] else ""
-                print(
-                    f"  {icon} {target:<22} avg={lat:<9} "
-                    f"loss={ping['loss']:>5.1f}%  roll={rolling_loss:>5.1f}%  "
-                    f"fail={st.consecutive_failures:<3}  http={http_code:<5}  {jit}"
+                # ── State update ──────────────────────────────────────────────
+                success = ping["loss"] < 100.0
+                st.rolling.append(success)
+                rolling_loss = round(
+                    (1 - sum(st.rolling) / len(st.rolling)) * 100, 1
                 )
+
+                if success:
+                    st.total_ok += 1
+                    st.consecutive_failures = 0
+                else:
+                    st.consecutive_failures += 1
+                    if st.consecutive_failures == ALERT_AFTER_FAILURES:
+                        notify(
+                            "⚠️ Network Drop",
+                            f"{target} via {iface_label} failed {ALERT_AFTER_FAILURES}× in a row",
+                        )
+                    if not st.traceroute_done:
+                        st.traceroute_done = True
+                        run_traceroute(target, OUTPUT_DIR)
+
+                # ── Hourly accumulator ────────────────────────────────────────
+                hour_stats[key].update(
+                    success, ping["avg"], ping["max"], st.consecutive_failures, iface_label
+                )
+
+                # ── CSV row ───────────────────────────────────────────────────
+                row: dict = {
+                    "timestamp":            ts,
+                    "target":               target,
+                    "resolved_ip":          resolved_ip or "UNRESOLVED",
+                    "dns_resolve_ms":       dns_ms if dns_ms is not None else "",
+                    "ping_min_ms":          ping["min"] if ping["min"] is not None else "",
+                    "ping_avg_ms":          ping["avg"] if ping["avg"] is not None else "",
+                    "ping_max_ms":          ping["max"] if ping["max"] is not None else "",
+                    "ping_jitter_ms":       ping["jitter"] if ping["jitter"] is not None else "",
+                    "packet_loss_pct":      ping["loss"],
+                    "rolling_loss_pct":     rolling_loss,
+                    "consecutive_failures": st.consecutive_failures,
+                    "ping_status":          ping["status"],
+                    "http_status_code":     http_code,
+                    "http_latency_ms":      http_ms if http_ms is not None else "",
+                    "interface":            iface_label,
+                }
+                append_csv(csv_path, row)
+
+                # ── Verbose console output ────────────────────────────────────
+                if args.verbose:
+                    icon = "✅" if success else "❌"
+                    lat  = f"{ping['avg']}ms" if ping["avg"] else "     —"
+                    jit  = f"jitter={ping['jitter']}ms" if ping["jitter"] else ""
+                    print(
+                        f"  {icon} {iface_label:<18} {target:<22} avg={lat:<9} "
+                        f"loss={ping['loss']:>5.1f}%  roll={rolling_loss:>5.1f}%  "
+                        f"fail={st.consecutive_failures:<3}  {jit}"
+                    )
+
+            if args.verbose:
+                print()  # blank line between interfaces in verbose mode
 
         # ── Verbose: end-of-cycle footer ──────────────────────────────────────
         elapsed = time.monotonic() - cycle_start
         if args.verbose:
-            print(f"  [{ts}]  iface={iface}  cycle={elapsed:.2f}s\n")
+            print(f"  [{ts}]  cycle={elapsed:.2f}s\n")
 
         # ── Hourly rollover ───────────────────────────────────────────────────
         this_hour = _hour_key()
@@ -579,7 +642,8 @@ def run() -> None:
             if not args.quiet:
                 flush_hour(active_hour)
             active_hour = this_hour
-            hour_stats  = {t: HourlySummary() for t in TARGETS}
+            for key in hour_stats:
+                hour_stats[key] = HourlySummary()
 
         time.sleep(max(0.0, INTERVAL_SECONDS - elapsed))
 
