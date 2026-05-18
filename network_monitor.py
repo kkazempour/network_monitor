@@ -238,7 +238,6 @@ def resolve_dns(hostname: str) -> tuple[str | None, float | None]:
 #  ICMP ping
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def ping_host(host: str) -> dict:
 def ping_host(host: str, source_ip: str = "") -> dict:
     """
     Run the system `ping` command and parse the results.
