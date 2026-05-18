@@ -277,6 +277,8 @@ For multi-day runs use `MM-dd HH:mm` instead.
 
 ## How to Read the Chart
 
+![Chart Reading Guide](docs/chart-guide.svg)
+
 ```
   Latency (ms) — left axis          Packet Loss % — right axis
        │                                    │
@@ -317,6 +319,8 @@ For multi-day runs use `MM-dd HH:mm` instead.
 ---
 
 ## Debugging Checklist
+
+![Debugging Flowchart](docs/debug-flow.svg)
 
 Use the CSV columns to answer these questions:
 
