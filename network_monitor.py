@@ -50,11 +50,13 @@ from pathlib import Path
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 TARGETS: list[str] = [
+    "192.168.1.1",   # Uncomment to add your router/gateway
+    "75.75.75.75",
     "8.8.8.8",         # Google Public DNS (good baseline — never goes down)
     "1.1.1.1",         # Cloudflare DNS
     "google.com",      # External hostname — exercises DNS + routing
-    "apple.com",       # Another external hostname
-    # "192.168.1.1",   # Uncomment to add your router/gateway
+    "apple.com"       # Another external hostname
+    
 ]
 
 # How often to run a full check cycle (seconds).
