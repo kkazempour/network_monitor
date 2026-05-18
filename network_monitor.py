@@ -57,32 +57,43 @@ TARGETS: list[str] = [
     # "192.168.1.1",   # Uncomment to add your router/gateway
 ]
 
-# How often to run a full check cycle (seconds)
+# How often to run a full check cycle (seconds).
+# With MONITOR_ALL_INTERFACES=True the effective work per cycle doubles
+# (both WiFi and Ethernet are tested), so keep this ≥ 5 s.
 INTERVAL_SECONDS: int = 5
 
-# Number of ICMP pings per target per cycle (avg/jitter are calculated across these)
+# Number of ICMP pings per target per cycle (avg / jitter calculated across these).
+# Higher values give more accurate jitter readings but slow each cycle down.
 PING_COUNT: int = 4
 
-# Single ping timeout (seconds).  macOS uses milliseconds internally — handled below.
+# Per-ping timeout in seconds. Any ping that exceeds this counts as lost (100% loss
+# for that packet). macOS converts this to milliseconds internally — handled below.
 PING_TIMEOUT_SECONDS: int = 2
 
-# Sliding window size for rolling packet-loss % (samples, not seconds)
-# Default 12 × 5 s = last 60 seconds
+# Rolling window size for rolling_loss_pct — measured in SAMPLES, not seconds.
+# Effective time window = ROLLING_WINDOW × INTERVAL_SECONDS  (default: 12 × 5 s = 60 s)
+# If you change INTERVAL_SECONDS, adjust this to keep the same time window.
 ROLLING_WINDOW: int = 12
 
-# HTTP check timeout (seconds).  Set to 0 to disable HTTP checks.
+# Timeout for the HTTP HEAD check in seconds. Set to 0 to disable HTTP checks entirely.
+# The check issues a HEAD request to the target — useful for hosts that block ICMP pings.
 HTTP_TIMEOUT_SECONDS: int = 3
 
-# Send a macOS notification after this many consecutive failures
+# Number of consecutive 100%-loss cycles before a macOS desktop notification fires.
+# Tracked independently per target AND per interface — a WiFi drop on 8.8.8.8 will
+# alert separately from an Ethernet drop on the same host.
 ALERT_AFTER_FAILURES: int = 3
 
-# Where to write output files.  "." means current working directory.
+# Directory where the CSV and traceroute snapshot files are written.
+# "." means the folder you run the script from.
 OUTPUT_DIR: Path = Path(".")
 
-# Set to True to ping every target via BOTH WiFi and Ethernet simultaneously.
-# Each cycle produces two CSV rows per target — one per interface — so you
-# can directly compare whether a drop is wireless-only or affects both paths.
-# If only one interface is active the script falls back gracefully.
+# True  — ping every target via WiFi AND Ethernet simultaneously.
+#         Each cycle produces two CSV rows per target (one per interface) so you
+#         can directly compare whether a drop is wireless-only or affects both paths.
+#         Falls back gracefully if only one interface is active.
+# False — ping via the first active interface found only (typically Ethernet on a
+#         Mac mini, WiFi on a MacBook). Halves the number of CSV rows per cycle.
 MONITOR_ALL_INTERFACES: bool = True
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

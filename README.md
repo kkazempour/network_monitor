@@ -64,21 +64,40 @@ Edit the `CONFIG` block near the top of `network_monitor.py`:
 
 ```python
 TARGETS: list[str] = [
-    "8.8.8.8",       # Google Public DNS
-    "apple.com",     # External hostname — exercises DNS + routing
+    "8.8.8.8",       # Google Public DNS  — good baseline, rarely goes down
+    "apple.com",     # External hostname  — exercises DNS resolution + routing
     "75.75.75.75",   # Comcast DNS (primary)
     "75.75.76.76",   # Comcast DNS (secondary)
-    # "192.168.1.1", # Uncomment to add your router/gateway
+    # "192.168.1.1", # Uncomment to add your router / gateway
 ]
 
-INTERVAL_SECONDS      = 5    # How often to ping each target
-PING_COUNT            = 4    # Pings per burst (used for avg / jitter)
-PING_TIMEOUT_SECONDS  = 2    # Per-ping timeout
-ROLLING_WINDOW        = 12   # Samples for rolling loss  (12 × 5s = 60s)
-HTTP_TIMEOUT_SECONDS  = 3    # Set to 0 to disable HTTP checks
-ALERT_AFTER_FAILURES   = 3     # Desktop alert threshold (consecutive failures)
-MONITOR_ALL_INTERFACES = True  # Ping via WiFi AND Ethernet simultaneously
-OUTPUT_DIR             = Path(".")  # Where to write the CSV
+INTERVAL_SECONDS       = 5    # Seconds between each full ping cycle.
+                               # Doubles in effective work when MONITOR_ALL_INTERFACES=True.
+
+PING_COUNT             = 4    # Pings per burst — avg / jitter calculated across these.
+                               # Higher = more accurate jitter, slower cycle.
+
+PING_TIMEOUT_SECONDS   = 2    # Per-ping timeout in seconds.
+                               # Any ping exceeding this counts as 100% loss for that packet.
+
+ROLLING_WINDOW         = 12   # Window for rolling_loss_pct — in SAMPLES, not seconds.
+                               # Effective window = ROLLING_WINDOW × INTERVAL_SECONDS
+                               # Default: 12 × 5 s = 60 s. Adjust if you change INTERVAL_SECONDS.
+
+HTTP_TIMEOUT_SECONDS   = 3    # Timeout for the HTTP HEAD check in seconds.
+                               # Set to 0 to disable HTTP checks entirely.
+
+ALERT_AFTER_FAILURES   = 3    # Consecutive 100%-loss cycles before a macOS notification fires.
+                               # Tracked per target AND per interface independently.
+
+OUTPUT_DIR             = Path(".")  # Where CSV and traceroute files are written.
+                                    # "." = the folder you run the script from.
+
+MONITOR_ALL_INTERFACES = True  # True  — ping via WiFi AND Ethernet simultaneously.
+                                #         Two CSV rows per target per cycle (one per interface).
+                                #         Falls back to one interface if only one is active.
+                                # False — use the first active interface found only.
+                                #         Typically Ethernet on a Mac mini, WiFi on a MacBook.
 ```
 
 ---
