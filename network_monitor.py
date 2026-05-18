@@ -28,6 +28,7 @@ Usage
   3. Press Ctrl+C to stop — summary is printed and CSV path is shown.
 """
 
+import argparse
 import csv
 import datetime
 import os
@@ -49,14 +50,11 @@ from pathlib import Path
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 TARGETS: list[str] = [
-    "192.168.1.1",     # router/gateway
-    "75.75.75.75",   # Comcast DNS (primary)
-    "75.75.76.76",   # Comcast DNS (secondary)
     "8.8.8.8",         # Google Public DNS (good baseline — never goes down)
     "1.1.1.1",         # Cloudflare DNS
-    "apple.com"        # Another external hostname
-    
-    
+    "google.com",      # External hostname — exercises DNS + routing
+    "apple.com",       # Another external hostname
+    # "192.168.1.1",   # Uncomment to add your router/gateway
 ]
 
 # How often to run a full check cycle (seconds)
@@ -105,6 +103,35 @@ CSV_FIELDS = [
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CLI arguments
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Network health monitor — pings targets and logs to CSV.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+output modes:
+  (default)   Quiet  — one summary block per hour, printed on the hour
+  -v          Verbose — one line per target per cycle  (~every 5 s)
+  -q          Silent  — no periodic output; alerts + final summary only
+        """,
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Print one line per target per cycle (good for active debugging)",
+    )
+    group.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="No periodic output — only failure alerts and the exit summary",
+    )
+    return parser.parse_args()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  Per-target state
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -116,6 +143,57 @@ class TargetState:
         self.traceroute_done: bool = False          # Fire traceroute only once
         self.total_cycles: int = 0
         self.total_ok: int = 0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Hourly summary accumulator
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class HourlySummary:
+    """Accumulates per-target stats across one clock hour."""
+
+    def __init__(self) -> None:
+        self.cycles: int = 0
+        self.ok_cycles: int = 0
+        self.latencies: list[float] = []
+        self.max_latency: float = 0.0
+        self.drop_cycles: int = 0
+        self.max_consec: int = 0
+        self.interfaces: set[str] = set()
+
+    def update(
+        self,
+        success: bool,
+        avg_ms: float | None,
+        max_ms: float | None,
+        consec: int,
+        iface: str,
+    ) -> None:
+        self.cycles += 1
+        if success:
+            self.ok_cycles += 1
+            if avg_ms is not None:
+                self.latencies.append(avg_ms)
+            if max_ms is not None:
+                self.max_latency = max(self.max_latency, max_ms)
+        else:
+            self.drop_cycles += 1
+        self.max_consec = max(self.max_consec, consec)
+        self.interfaces.add(iface)
+
+    def render(self, target: str) -> str:
+        uptime = (self.ok_cycles / self.cycles * 100) if self.cycles else 0.0
+        avg    = sum(self.latencies) / len(self.latencies) if self.latencies else None
+        icon   = "✅" if uptime >= 99 else ("⚠️ " if uptime >= 80 else "❌")
+        avg_s  = f"{avg:.1f}ms"              if avg is not None    else "      —"
+        max_s  = f"{self.max_latency:.1f}ms" if self.max_latency   else "     —"
+        streak = f"  worst_streak={self.max_consec}" if self.max_consec else ""
+        iface  = "/".join(sorted(self.interfaces))
+        return (
+            f"  {icon} {target:<22}  uptime={uptime:>5.1f}%  "
+            f"avg={avg_s:<9}  max={max_s:<9}  "
+            f"drops={self.drop_cycles:<4}{streak}  [{iface}]"
+        )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -360,6 +438,8 @@ def print_summary(states: dict[str, TargetState], csv_path: Path) -> None:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def run() -> None:
+    args = parse_args()
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ts_start = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = OUTPUT_DIR / f"network_health_{ts_start}.csv"
@@ -367,23 +447,54 @@ def run() -> None:
     states: dict[str, TargetState] = {t: TargetState(t) for t in TARGETS}
     init_csv(csv_path)
 
+    mode_label = (
+        "verbose  (one line per cycle)"  if args.verbose else
+        "silent   (alerts + exit summary only)" if args.quiet  else
+        "quiet    (hourly summary)"
+    )
     print(f"\n{'━'*60}")
     print(f"  🌐  Network Monitor  —  {len(TARGETS)} target(s)")
     print(f"  ⏱   Interval: {INTERVAL_SECONDS}s   Pings/cycle: {PING_COUNT}")
-    print(f"  📄  Output: {csv_path.resolve()}")
-    print(f"  Press Ctrl+C to stop and see summary")
+    print(f"  🖥   Output mode: {mode_label}")
+    print(f"  📄  CSV: {csv_path.resolve()}")
+    print(f"  Press Ctrl+C to stop")
     print(f"{'━'*60}\n")
 
+    # ── Hourly summary state ──────────────────────────────────────────────────
+
+    def _hour_key() -> str:
+        return datetime.datetime.now().strftime("%Y-%m-%d %H:00")
+
+    active_hour = _hour_key()
+    hour_stats: dict[str, HourlySummary] = {t: HourlySummary() for t in TARGETS}
+
+    def flush_hour(label: str) -> None:
+        end_dt    = datetime.datetime.strptime(label, "%Y-%m-%d %H:00") + datetime.timedelta(hours=1)
+        end_label = end_dt.strftime("%H:%M")
+        print(f"\n{'─'*72}")
+        print(f"  HOURLY SUMMARY   {label} → {end_label}")
+        print(f"{'─'*72}")
+        for t in TARGETS:
+            print(hour_stats[t].render(t))
+        print(f"{'─'*72}\n")
+
+    # ── Signal handlers ───────────────────────────────────────────────────────
+
     def shutdown(sig, frame):  # noqa: ANN001
+        # In quiet/default mode, flush whatever partial hour we have on exit
+        if not args.verbose and not args.quiet:
+            flush_hour(active_hour)
         print_summary(states, csv_path)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
     while True:
         cycle_start = time.monotonic()
-        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        ts    = datetime.datetime.now().isoformat(timespec="seconds")
         iface = get_active_interface()  # sampled once per cycle
 
         for target in TARGETS:
@@ -412,16 +523,19 @@ def run() -> None:
                 st.consecutive_failures = 0
             else:
                 st.consecutive_failures += 1
-                # Notification threshold
                 if st.consecutive_failures == ALERT_AFTER_FAILURES:
                     notify(
                         "⚠️ Network Drop",
                         f"{target} has failed {ALERT_AFTER_FAILURES}× in a row",
                     )
-                # Traceroute — fire once on first failure
                 if not st.traceroute_done:
                     st.traceroute_done = True
                     run_traceroute(target, OUTPUT_DIR)
+
+            # ── Hourly accumulator ────────────────────────────────────────────
+            hour_stats[target].update(
+                success, ping["avg"], ping["max"], st.consecutive_failures, iface
+            )
 
             # ── CSV row ───────────────────────────────────────────────────────
             row: dict = {
@@ -443,22 +557,31 @@ def run() -> None:
             }
             append_csv(csv_path, row)
 
-            # ── Console line ─────────────────────────────────────────────────
-            icon = "✅" if success else "❌"
-            lat = f"{ping['avg']}ms" if ping["avg"] else "     —"
-            jit = f"jitter={ping['jitter']}ms" if ping["jitter"] else ""
-            print(
-                f"  {icon} {target:<22} avg={lat:<9} "
-                f"loss={ping['loss']:>5.1f}%  roll={rolling_loss:>5.1f}%  "
-                f"fail={st.consecutive_failures:<3}  http={http_code:<5}  "
-                f"{jit}"
-            )
+            # ── Verbose console output ────────────────────────────────────────
+            if args.verbose:
+                icon = "✅" if success else "❌"
+                lat  = f"{ping['avg']}ms" if ping["avg"] else "     —"
+                jit  = f"jitter={ping['jitter']}ms" if ping["jitter"] else ""
+                print(
+                    f"  {icon} {target:<22} avg={lat:<9} "
+                    f"loss={ping['loss']:>5.1f}%  roll={rolling_loss:>5.1f}%  "
+                    f"fail={st.consecutive_failures:<3}  http={http_code:<5}  {jit}"
+                )
 
+        # ── Verbose: end-of-cycle footer ──────────────────────────────────────
         elapsed = time.monotonic() - cycle_start
-        print(f"  [{ts}]  iface={iface}  cycle={elapsed:.2f}s\n")
+        if args.verbose:
+            print(f"  [{ts}]  iface={iface}  cycle={elapsed:.2f}s\n")
 
-        sleep_time = max(0.0, INTERVAL_SECONDS - elapsed)
-        time.sleep(sleep_time)
+        # ── Hourly rollover ───────────────────────────────────────────────────
+        this_hour = _hour_key()
+        if this_hour != active_hour:
+            if not args.quiet:
+                flush_hour(active_hour)
+            active_hour = this_hour
+            hour_stats  = {t: HourlySummary() for t in TARGETS}
+
+        time.sleep(max(0.0, INTERVAL_SECONDS - elapsed))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

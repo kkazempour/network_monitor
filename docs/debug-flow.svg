@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 560" width="920" height="560"
+     font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif">
+  <defs>
+    <!-- Card shadow -->
+    <filter id="cardShadow" x="-2%" y="-2%" width="104%" height="106%">
+      <feDropShadow dx="0" dy="3" stdDeviation="6" flood-color="#00000014"/>
+    </filter>
+    <!-- Box shadow -->
+    <filter id="boxShadow" x="-5%" y="-8%" width="110%" height="125%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0000001a"/>
+    </filter>
+    <!-- Arrowhead (dark) -->
+    <marker id="arr" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto">
+      <path d="M0,0.5 L0,6.5 L8.5,3.5 Z" fill="#94a3b8"/>
+    </marker>
+    <!-- Arrowhead (green) -->
+    <marker id="arrGreen" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto">
+      <path d="M0,0.5 L0,6.5 L8.5,3.5 Z" fill="#16a34a"/>
+    </marker>
+    <!-- Arrowhead (red) -->
+    <marker id="arrRed" markerWidth="9" markerHeight="9" refX="8" refY="3.5" orient="auto">
+      <path d="M0,0.5 L0,6.5 L8.5,3.5 Z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <!-- ── Card background ── -->
+  <rect width="920" height="560" rx="16" fill="#f8fafc" stroke="#e2e8f0"
+        stroke-width="1.5" filter="url(#cardShadow)"/>
+
+  <!-- ── Title ── -->
+  <text x="460" y="34" text-anchor="middle" font-size="17" font-weight="700" fill="#0f172a">
+    Network Drop Debugging Guide
+  </text>
+  <text x="460" y="53" text-anchor="middle" font-size="12" fill="#64748b">
+    Use the CSV columns to isolate the root cause — work top to bottom
+  </text>
+
+  <!-- ══════════════════════════════════════════════════
+       Layout:
+         Start box           y=70
+         D1 diamond          y=140   All 4 targets fail?
+         D2 diamond          y=235   ping OK but http = ERROR?
+         D3 diamond          y=330   dns_resolve_ms spiking?
+         D4 diamond          y=425   interface = WiFi only?
+         Footer bar          y=495
+
+         Left terminals  x≈80  (YES branches from D1, D4)
+         Right terminals x≈600 (YES branches from D2, D3, D4-NO)
+  ══════════════════════════════════════════════════ -->
+
+  <!-- ────────────────── HELPERS: diamond macro ──────────────────
+       Each diamond: cx,cy with hw=155 hh=33
+  ──────────────────────────────────────────────────────────────── -->
+
+  <!-- ══ START BOX ══ -->
+  <rect x="296" y="66" width="328" height="46" rx="23"
+        fill="#fef2f2" stroke="#dc2626" stroke-width="2"
+        filter="url(#boxShadow)"/>
+  <text x="460" y="83" text-anchor="middle" font-size="12" font-weight="700" fill="#991b1b">⚠️  Network drop detected in CSV</text>
+  <text x="460" y="101" text-anchor="middle" font-size="10" fill="#b91c1c">rolling_loss_pct &gt; 0  or  consecutive_failures &gt; 0</text>
+
+  <!-- Arrow: start → D1 -->
+  <line x1="460" y1="112" x2="460" y2="126" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- ══ D1: All 4 targets fail? ══ -->
+  <!-- Diamond: cx=460 cy=148 hw=158 hh=33 -->
+  <polygon points="460,115  618,148  460,181  302,148"
+           fill="#fffbeb" stroke="#f59e0b" stroke-width="2" filter="url(#boxShadow)"/>
+  <text x="460" y="143" text-anchor="middle" font-size="10" font-weight="700" fill="#78350f">All 4 targets fail</text>
+  <text x="460" y="158" text-anchor="middle" font-size="10" font-weight="700" fill="#78350f">at the same timestamp?</text>
+
+  <!-- D1 YES → LEFT: Router/Modem terminal -->
+  <line x1="302" y1="148" x2="232" y2="148" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arrRed)"/>
+  <text x="278" y="141" text-anchor="middle" font-size="9" font-weight="700" fill="#dc2626">YES</text>
+  <rect x="38" y="124" width="192" height="52" rx="8"
+        fill="white" stroke="#fecaca" stroke-width="1.5" filter="url(#boxShadow)"/>
+  <text x="134" y="141" text-anchor="middle" font-size="11" font-weight="700" fill="#991b1b">🏠 Router / Modem</text>
+  <text x="134" y="156" text-anchor="middle" font-size="10" fill="#4b5563">Local connection dropped</text>
+  <text x="134" y="169" text-anchor="middle" font-size="10" fill="#6b7280">Ping your gateway first</text>
+
+  <!-- D1 NO → down: arrow -->
+  <line x1="460" y1="181" x2="460" y2="205" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="468" y="198" font-size="9" font-weight="700" fill="#16a34a">NO</text>
+
+  <!-- ══ D2: ping OK + http = ERROR? ══ -->
+  <polygon points="460,205  618,238  460,271  302,238"
+           fill="#fffbeb" stroke="#f59e0b" stroke-width="2" filter="url(#boxShadow)"/>
+  <text x="460" y="233" text-anchor="middle" font-size="10" font-weight="700" fill="#78350f">ping_status = ok  but</text>
+  <text x="460" y="248" text-anchor="middle" font-size="10" font-weight="700" fill="#78350f">http_status_code = ERROR?</text>
+
+  <!-- D2 YES → RIGHT: Service Down -->
+  <line x1="618" y1="238" x2="648" y2="238" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arrRed)"/>
+  <text x="634" y="231" text-anchor="middle" font-size="9" font-weight="700" fill="#dc2626">YES</text>
+  <rect x="650" y="214" width="230" height="52" rx="8"
+        fill="white" stroke="#fecaca" stroke-width="1.5" filter="url(#boxShadow)"/>
+  <text x="765" y="231" text-anchor="middle" font-size="11" font-weight="700" fill="#991b1b">🌐 Service Outage</text>
+  <text x="765" y="246" text-anchor="middle" font-size="10" fill="#4b5563">Network is fine — host is down</text>
+  <text x="765" y="260" text-anchor="middle" font-size="10" fill="#6b7280">ICMP passes, HTTP fails</text>
+
+  <!-- D2 NO → down -->
+  <line x1="460" y1="271" x2="460" y2="295" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="468" y="288" font-size="9" font-weight="700" fill="#16a34a">NO</text>
+
+  <!-- ══ D3: dns_resolve_ms spiking? ══ -->
+  <polygon points="460,295  618,328  460,361  302,328"
+           fill="#fffbeb" stroke="#f59e0b" stroke-width="2" filter="url(#boxShadow)"/>
+  <text x="460" y="323" text-anchor="middle" font-size="10" font-weight="700" fill="#78350f">dns_resolve_ms spiking</text>
+  <text x="460" y="338" text-anchor="middle" font-size="10" font-weight="700" fill="#78350f">or UNRESOLVED in CSV?</text>
+
+  <!-- D3 YES → RIGHT: DNS Failure -->
+  <line x1="618" y1="328" x2="648" y2="328" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arrRed)"/>
+  <text x="634" y="321" text-anchor="middle" font-size="9" font-weight="700" fill="#dc2626">YES</text>
+  <rect x="650" y="304" width="230" height="52" rx="8"
+        fill="white" stroke="#fecaca" stroke-width="1.5" filter="url(#boxShadow)"/>
+  <text x="765" y="321" text-anchor="middle" font-size="11" font-weight="700" fill="#991b1b">🔍 DNS Failure</text>
+  <text x="765" y="336" text-anchor="middle" font-size="10" fill="#4b5563">Routing works, DNS broken</text>
+  <text x="765" y="350" text-anchor="middle" font-size="10" fill="#6b7280">Try switching DNS servers</text>
+
+  <!-- D3 NO → down -->
+  <line x1="460" y1="361" x2="460" y2="385" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="468" y="378" font-size="9" font-weight="700" fill="#16a34a">NO</text>
+
+  <!-- ══ D4: interface = WiFi only? ══ -->
+  <polygon points="460,385  618,418  460,451  302,418"
+           fill="#fffbeb" stroke="#f59e0b" stroke-width="2" filter="url(#boxShadow)"/>
+  <text x="460" y="413" text-anchor="middle" font-size="10" font-weight="700" fill="#78350f">Drops appear only on rows</text>
+  <text x="460" y="428" text-anchor="middle" font-size="10" font-weight="700" fill="#78350f">where interface = WiFi?</text>
+
+  <!-- D4 YES → LEFT: Wireless -->
+  <line x1="302" y1="418" x2="232" y2="418" stroke="#dc2626" stroke-width="1.5" marker-end="url(#arrRed)"/>
+  <text x="278" y="411" text-anchor="middle" font-size="9" font-weight="700" fill="#dc2626">YES</text>
+  <rect x="38" y="394" width="192" height="52" rx="8"
+        fill="white" stroke="#fecaca" stroke-width="1.5" filter="url(#boxShadow)"/>
+  <text x="134" y="411" text-anchor="middle" font-size="11" font-weight="700" fill="#991b1b">📡 Wireless Issue</text>
+  <text x="134" y="426" text-anchor="middle" font-size="10" fill="#4b5563">Interference or weak signal</text>
+  <text x="134" y="440" text-anchor="middle" font-size="10" fill="#6b7280">Test with Ethernet cable</text>
+
+  <!-- D4 NO → RIGHT: Open Traceroute -->
+  <line x1="618" y1="418" x2="648" y2="418" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrGreen)"/>
+  <text x="634" y="411" text-anchor="middle" font-size="9" font-weight="700" fill="#16a34a">NO</text>
+  <rect x="650" y="394" width="230" height="52" rx="8"
+        fill="white" stroke="#bbf7d0" stroke-width="1.5" filter="url(#boxShadow)"/>
+  <text x="765" y="411" text-anchor="middle" font-size="11" font-weight="700" fill="#166534">🗺  Open traceroute_*.txt</text>
+  <text x="765" y="426" text-anchor="middle" font-size="10" fill="#4b5563">First hop with * * * = break point</text>
+  <text x="765" y="440" text-anchor="middle" font-size="10" fill="#6b7280">ISP or upstream routing issue</text>
+
+  <!-- ══ FOOTER FORMULA BAR ══ -->
+  <rect x="78" y="468" width="764" height="72" rx="10"
+        fill="white" stroke="#e2e8f0" stroke-width="1.2" filter="url(#boxShadow)"/>
+
+  <!-- 3 formula pills in the footer -->
+  <!-- Pill 1: duration -->
+  <rect x="90" y="480" width="234" height="48" rx="8" fill="#eff6ff"/>
+  <text x="207" y="497" text-anchor="middle" font-size="10" font-weight="700" fill="#1e40af">⏱  Outage Duration</text>
+  <text x="207" y="512" text-anchor="middle" font-size="10" fill="#3b82f6">consecutive_failures × INTERVAL_SECONDS</text>
+  <text x="207" y="524" text-anchor="middle" font-size="9" fill="#64748b">e.g. 6 failures × 5 s = 30 s outage</text>
+
+  <!-- Pill 2: uptime -->
+  <rect x="343" y="480" width="234" height="48" rx="8" fill="#f0fdf4"/>
+  <text x="460" y="497" text-anchor="middle" font-size="10" font-weight="700" fill="#166534">📊  Target Uptime %</text>
+  <text x="460" y="512" text-anchor="middle" font-size="10" fill="#16a34a">ok cycles ÷ total cycles × 100</text>
+  <text x="460" y="524" text-anchor="middle" font-size="9" fill="#64748b">See final summary on Ctrl+C</text>
+
+  <!-- Pill 3: worst event -->
+  <rect x="596" y="480" width="234" height="48" rx="8" fill="#fff7ed"/>
+  <text x="713" y="497" text-anchor="middle" font-size="10" font-weight="700" fill="#9a3412">🔎  Find Worst Events</text>
+  <text x="713" y="512" text-anchor="middle" font-size="10" fill="#ea580c">Sort CSV by consecutive_failures ↓</text>
+  <text x="713" y="524" text-anchor="middle" font-size="9" fill="#64748b">Top rows = your longest drops</text>
+</svg>
