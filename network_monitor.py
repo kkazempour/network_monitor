@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""
+network_monitor.py
+──────────────────
+Monitors network health by pinging (ICMP) and HTTP-checking a list of
+targets at a regular interval. All results are appended to a timestamped
+CSV that you can drag straight into Numbers, Excel, or Grapher.
+
+Features
+--------
+  • ICMP ping  – min / avg / max latency + jitter
+  • DNS resolution timing  – separate from ICMP so you can tell them apart
+  • HTTP/HTTPS head-check  – catches hosts that block ICMP pings
+  • Rolling packet-loss %  – sliding window (default: last 60 s)
+  • Consecutive failure counter  – per target
+  • Active interface tagging  – WiFi / Ethernet / unknown, sampled per cycle
+  • Traceroute snapshot  – fires once on the *first* failure per target,
+                           saved next to the CSV as traceroute_<target>.txt
+  • macOS notification  – desktop alert after N consecutive failures
+  • Summary report  – printed on Ctrl+C / SIGTERM
+
+Zero third-party dependencies  (stdlib + macOS system tools only)
+
+Usage
+-----
+  1. Edit the CONFIG section below.
+  2. python3 network_monitor.py
+  3. Press Ctrl+C to stop — summary is printed and CSV path is shown.
+"""
+
+import csv
+import datetime
+import os
+import platform
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections import deque
+from pathlib import Path
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CONFIG  — edit this section
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TARGETS: list[str] = [
+    "192.168.1.1",     # router/gateway
+    "75.75.75.75",   # Comcast DNS (primary)
+    "75.75.76.76",   # Comcast DNS (secondary)
+    "8.8.8.8",         # Google Public DNS (good baseline — never goes down)
+    "1.1.1.1",         # Cloudflare DNS
+    "apple.com"        # Another external hostname
+    
+    
+]
+
+# How often to run a full check cycle (seconds)
+INTERVAL_SECONDS: int = 5
+
+# Number of ICMP pings per target per cycle (avg/jitter are calculated across these)
+PING_COUNT: int = 4
+
+# Single ping timeout (seconds).  macOS uses milliseconds internally — handled below.
+PING_TIMEOUT_SECONDS: int = 2
+
+# Sliding window size for rolling packet-loss % (samples, not seconds)
+# Default 12 × 5 s = last 60 seconds
+ROLLING_WINDOW: int = 12
+
+# HTTP check timeout (seconds).  Set to 0 to disable HTTP checks.
+HTTP_TIMEOUT_SECONDS: int = 3
+
+# Send a macOS notification after this many consecutive failures
+ALERT_AFTER_FAILURES: int = 3
+
+# Where to write output files.  "." means current working directory.
+OUTPUT_DIR: Path = Path(".")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CSV schema
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CSV_FIELDS = [
+    "timestamp",            # ISO-8601 local time
+    "target",               # As entered in TARGETS
+    "resolved_ip",          # IP address after DNS lookup
+    "dns_resolve_ms",       # Time to resolve DNS (ms); blank if target is already an IP
+    "ping_min_ms",          # Fastest ICMP reply in the burst
+    "ping_avg_ms",          # Average ICMP reply
+    "ping_max_ms",          # Slowest ICMP reply
+    "ping_jitter_ms",       # Std-dev across the burst (macOS reports this directly)
+    "packet_loss_pct",      # Loss within this cycle's ping burst (0–100)
+    "rolling_loss_pct",     # Loss across the last ROLLING_WINDOW cycles
+    "consecutive_failures", # How many back-to-back cycles had 100% loss
+    "ping_status",          # ok | partial | timeout | error
+    "http_status_code",     # HTTP HEAD response code, or "SKIP" / "ERROR" / "TIMEOUT"
+    "http_latency_ms",      # Time to first byte for HTTP check (ms)
+    "interface",            # WiFi | Ethernet | unknown
+]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Per-target state
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class TargetState:
+    def __init__(self, target: str) -> None:
+        self.target = target
+        self.consecutive_failures: int = 0
+        self.rolling: deque[bool] = deque(maxlen=ROLLING_WINDOW)  # True = success
+        self.traceroute_done: bool = False          # Fire traceroute only once
+        self.total_cycles: int = 0
+        self.total_ok: int = 0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  DNS resolution
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def resolve_dns(hostname: str) -> tuple[str | None, float | None]:
+    """Return (resolved_ip, elapsed_ms) or (None, None) on failure."""
+    # Skip resolution if the target is already a bare IP address
+    try:
+        socket.inet_aton(hostname)   # raises OSError if not an IPv4 literal
+        return hostname, None
+    except OSError:
+        pass
+    try:
+        t0 = time.monotonic()
+        ip = socket.gethostbyname(hostname)
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        return ip, round(elapsed_ms, 2)
+    except socket.gaierror:
+        return None, None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  ICMP ping
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def ping_host(host: str) -> dict:
+    """
+    Run the system `ping` command and parse the results.
+    Returns a dict with keys: min, avg, max, jitter, loss, status.
+    """
+    is_macos = platform.system() == "Darwin"
+
+    if is_macos:
+        # -W timeout in milliseconds on macOS
+        cmd = [
+            "ping", "-c", str(PING_COUNT),
+            "-W", str(PING_TIMEOUT_SECONDS * 1000),
+            host,
+        ]
+    else:
+        # -W timeout in seconds on Linux
+        cmd = [
+            "ping", "-c", str(PING_COUNT),
+            "-W", str(PING_TIMEOUT_SECONDS),
+            host,
+        ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=PING_TIMEOUT_SECONDS * PING_COUNT + 5,
+        )
+        return _parse_ping(proc.stdout + proc.stderr)
+    except subprocess.TimeoutExpired:
+        return _empty_ping("timeout")
+    except Exception as exc:
+        return _empty_ping(f"error:{exc}")
+
+
+def _parse_ping(output: str) -> dict:
+    # Packet loss percentage
+    loss_m = re.search(r"(\d+(?:\.\d+)?)% packet loss", output)
+    loss = float(loss_m.group(1)) if loss_m else 100.0
+
+    # RTT summary line — macOS & Linux both emit min/avg/max/stddev
+    rtt_m = re.search(
+        r"(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)",
+        output,
+    )
+    if rtt_m:
+        rtt_min, rtt_avg, rtt_max, jitter = (float(x) for x in rtt_m.groups())
+        status = "ok" if loss == 0 else ("partial" if loss < 100 else "timeout")
+        return dict(min=rtt_min, avg=rtt_avg, max=rtt_max, jitter=jitter,
+                    loss=loss, status=status)
+    else:
+        status = "timeout" if loss >= 100 else "partial"
+        return _empty_ping(status, loss=loss)
+
+
+def _empty_ping(status: str, loss: float = 100.0) -> dict:
+    return dict(min=None, avg=None, max=None, jitter=None, loss=loss, status=status)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  HTTP check
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def http_check(target: str) -> tuple[str, float | None]:
+    """
+    Issue an HTTP HEAD request to the target.
+    Returns (status_code_or_label, latency_ms_or_None).
+    """
+    if HTTP_TIMEOUT_SECONDS == 0:
+        return "SKIP", None
+
+    # Build a URL — add https:// if the target looks like a hostname
+    if target.startswith(("http://", "https://")):
+        url = target
+    elif re.match(r"^\d+\.\d+\.\d+\.\d+$", target):
+        # Raw IP — HTTP may not be meaningful; skip
+        return "SKIP", None
+    else:
+        url = f"https://{target}"
+
+    req = urllib.request.Request(url, method="HEAD")
+    req.add_header("User-Agent", "network-monitor/1.0")
+    try:
+        t0 = time.monotonic()
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+            latency_ms = round((time.monotonic() - t0) * 1000, 2)
+            return str(resp.status), latency_ms
+    except urllib.error.HTTPError as exc:
+        latency_ms = round((time.monotonic() - t0) * 1000, 2)  # type: ignore[possibly-undefined]
+        return str(exc.code), latency_ms
+    except urllib.error.URLError:
+        return "ERROR", None
+    except TimeoutError:
+        return "TIMEOUT", None
+    except Exception:
+        return "ERROR", None
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Active interface detection  (macOS)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def get_active_interface() -> str:
+    """
+    Return the type of the default-route interface on macOS.
+    Falls back to "unknown" on any error or non-macOS platform.
+    """
+    if platform.system() != "Darwin":
+        return "unknown"
+    try:
+        # Find the interface used for the default route
+        route = subprocess.run(
+            ["route", "-n", "get", "default"],
+            capture_output=True, text=True, timeout=3,
+        )
+        iface_m = re.search(r"interface:\s+(\S+)", route.stdout)
+        if not iface_m:
+            return "unknown"
+        iface = iface_m.group(1)          # e.g. "en0", "en1", "utun0"
+
+        # Ask networksetup whether that interface is Wi-Fi or Ethernet
+        hw = subprocess.run(
+            ["networksetup", "-getmedia", iface],
+            capture_output=True, text=True, timeout=3,
+        )
+        combined = (hw.stdout + hw.stderr).lower()
+        if "wi-fi" in combined or "airport" in combined or "wireless" in combined:
+            return f"WiFi ({iface})"
+        if "ethernet" in combined or "1000base" in combined or "100base" in combined:
+            return f"Ethernet ({iface})"
+        # Fallback: check the interface name heuristic (en0 = Wi-Fi on most Macs)
+        if iface.startswith("en"):
+            return f"en-type ({iface})"
+        return f"other ({iface})"
+    except Exception:
+        return "unknown"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Traceroute  (fires once per target on first failure)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run_traceroute(target: str, output_dir: Path) -> None:
+    safe_name = re.sub(r"[^\w\-.]", "_", target)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = output_dir / f"traceroute_{safe_name}_{ts}.txt"
+
+    cmd = (
+        ["traceroute", "-m", "20", "-w", "2", target]
+        if platform.system() == "Darwin"
+        else ["traceroute", "-m", "20", "-w", "2", target]
+    )
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        out_path.write_text(
+            f"# Traceroute to {target}  —  {ts}\n\n"
+            + result.stdout
+            + (("\n\n# stderr:\n" + result.stderr) if result.stderr.strip() else "")
+        )
+        print(f"  🗺  Traceroute saved → {out_path.name}")
+    except Exception as exc:
+        print(f"  ⚠️  Traceroute failed: {exc}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  macOS notification
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def notify(title: str, message: str) -> None:
+    if platform.system() == "Darwin":
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{message}" with title "{title}"'],
+            capture_output=True,
+        )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CSV helpers
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def init_csv(filepath: Path) -> None:
+    with open(filepath, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
+
+
+def append_csv(filepath: Path, row: dict) -> None:
+    with open(filepath, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=CSV_FIELDS).writerow(row)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Summary report  (printed on exit)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def print_summary(states: dict[str, TargetState], csv_path: Path) -> None:
+    print("\n" + "━" * 60)
+    print("  SUMMARY")
+    print("━" * 60)
+    for target, st in states.items():
+        if st.total_cycles == 0:
+            continue
+        uptime = (st.total_ok / st.total_cycles) * 100
+        icon = "✅" if uptime >= 99 else ("⚠️ " if uptime >= 80 else "❌")
+        print(f"  {icon}  {target:<22}  uptime={uptime:.1f}%  "
+              f"({st.total_ok}/{st.total_cycles} cycles ok)")
+    print("━" * 60)
+    print(f"  📄  CSV saved to:  {csv_path.resolve()}")
+    print("━" * 60 + "\n")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Main loop
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def run() -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts_start = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = OUTPUT_DIR / f"network_health_{ts_start}.csv"
+
+    states: dict[str, TargetState] = {t: TargetState(t) for t in TARGETS}
+    init_csv(csv_path)
+
+    print(f"\n{'━'*60}")
+    print(f"  🌐  Network Monitor  —  {len(TARGETS)} target(s)")
+    print(f"  ⏱   Interval: {INTERVAL_SECONDS}s   Pings/cycle: {PING_COUNT}")
+    print(f"  📄  Output: {csv_path.resolve()}")
+    print(f"  Press Ctrl+C to stop and see summary")
+    print(f"{'━'*60}\n")
+
+    def shutdown(sig, frame):  # noqa: ANN001
+        print_summary(states, csv_path)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    while True:
+        cycle_start = time.monotonic()
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        iface = get_active_interface()  # sampled once per cycle
+
+        for target in TARGETS:
+            st = states[target]
+            st.total_cycles += 1
+
+            # ── DNS ──────────────────────────────────────────────────────────
+            resolved_ip, dns_ms = resolve_dns(target)
+            ping_host_addr = resolved_ip or target
+
+            # ── ICMP ping ─────────────────────────────────────────────────────
+            ping = ping_host(ping_host_addr)
+
+            # ── HTTP check ───────────────────────────────────────────────────
+            http_code, http_ms = http_check(target)
+
+            # ── State update ─────────────────────────────────────────────────
+            success = ping["loss"] < 100.0
+            st.rolling.append(success)
+            rolling_loss = round(
+                (1 - sum(st.rolling) / len(st.rolling)) * 100, 1
+            )
+
+            if success:
+                st.total_ok += 1
+                st.consecutive_failures = 0
+            else:
+                st.consecutive_failures += 1
+                # Notification threshold
+                if st.consecutive_failures == ALERT_AFTER_FAILURES:
+                    notify(
+                        "⚠️ Network Drop",
+                        f"{target} has failed {ALERT_AFTER_FAILURES}× in a row",
+                    )
+                # Traceroute — fire once on first failure
+                if not st.traceroute_done:
+                    st.traceroute_done = True
+                    run_traceroute(target, OUTPUT_DIR)
+
+            # ── CSV row ───────────────────────────────────────────────────────
+            row: dict = {
+                "timestamp":            ts,
+                "target":               target,
+                "resolved_ip":          resolved_ip or "UNRESOLVED",
+                "dns_resolve_ms":       dns_ms if dns_ms is not None else "",
+                "ping_min_ms":          ping["min"] if ping["min"] is not None else "",
+                "ping_avg_ms":          ping["avg"] if ping["avg"] is not None else "",
+                "ping_max_ms":          ping["max"] if ping["max"] is not None else "",
+                "ping_jitter_ms":       ping["jitter"] if ping["jitter"] is not None else "",
+                "packet_loss_pct":      ping["loss"],
+                "rolling_loss_pct":     rolling_loss,
+                "consecutive_failures": st.consecutive_failures,
+                "ping_status":          ping["status"],
+                "http_status_code":     http_code,
+                "http_latency_ms":      http_ms if http_ms is not None else "",
+                "interface":            iface,
+            }
+            append_csv(csv_path, row)
+
+            # ── Console line ─────────────────────────────────────────────────
+            icon = "✅" if success else "❌"
+            lat = f"{ping['avg']}ms" if ping["avg"] else "     —"
+            jit = f"jitter={ping['jitter']}ms" if ping["jitter"] else ""
+            print(
+                f"  {icon} {target:<22} avg={lat:<9} "
+                f"loss={ping['loss']:>5.1f}%  roll={rolling_loss:>5.1f}%  "
+                f"fail={st.consecutive_failures:<3}  http={http_code:<5}  "
+                f"{jit}"
+            )
+
+        elapsed = time.monotonic() - cycle_start
+        print(f"  [{ts}]  iface={iface}  cycle={elapsed:.2f}s\n")
+
+        sleep_time = max(0.0, INTERVAL_SECONDS - elapsed)
+        time.sleep(sleep_time)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if __name__ == "__main__":
+    run()
