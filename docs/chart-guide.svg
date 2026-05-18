@@ -34,7 +34,7 @@
     How to Read the Network Health Chart
   </text>
   <text x="460" y="51" text-anchor="middle" font-size="12" fill="#64748b">
-    Blue line = ping_avg_ms  (left axis, ms)     ·     Green area = rolling_loss_pct  (right axis, %)
+    Blue line = ping_avg_ms  ·  Green area = rolling_loss_pct  ·  Filter by interface column to compare WiFi vs Ethernet
   </text>
 
   <!-- ══════════════════════════════════════════════════════════

@@ -16,7 +16,8 @@ unattended to diagnose intermittent network drops.
 | HTTP/HTTPS check | Catches hosts that silently block ICMP pings |
 | Rolling packet-loss % | Sliding window (default: last 60 s) — smooths blips vs real outages |
 | Consecutive failure counter | Per-target streak count |
-| Active interface tagging | WiFi / Ethernet / unknown, sampled per cycle |
+| Active interface tagging | WiFi / Ethernet / unknown, tagged on every CSV row |
+| Dual-interface monitoring | Pings each target via WiFi **and** Ethernet simultaneously — directly isolates wireless drops without guessing |
 | Traceroute snapshot | Auto-fires on first failure per target, saved as a `.txt` sidecar |
 | macOS notification | Desktop alert after N consecutive failures |
 | Three output modes | Verbose, Quiet (hourly), Silent |
@@ -26,7 +27,7 @@ unattended to diagnose intermittent network drops.
 
 ## Requirements
 
-- **macOS** (uses `ping`, `traceroute`, `route`, `networksetup`, `osascript`)
+- **macOS** (uses `ping`, `traceroute`, `networksetup`, `ipconfig`, `osascript`)
 - **Python 3.10 or later** — no pip installs required, pure stdlib
 
 ```bash
@@ -75,8 +76,9 @@ PING_COUNT            = 4    # Pings per burst (used for avg / jitter)
 PING_TIMEOUT_SECONDS  = 2    # Per-ping timeout
 ROLLING_WINDOW        = 12   # Samples for rolling loss  (12 × 5s = 60s)
 HTTP_TIMEOUT_SECONDS  = 3    # Set to 0 to disable HTTP checks
-ALERT_AFTER_FAILURES  = 3    # Desktop alert threshold (consecutive failures)
-OUTPUT_DIR            = Path(".")  # Where to write the CSV
+ALERT_AFTER_FAILURES   = 3     # Desktop alert threshold (consecutive failures)
+MONITOR_ALL_INTERFACES = True  # Ping via WiFi AND Ethernet simultaneously
+OUTPUT_DIR             = Path(".")  # Where to write the CSV
 ```
 
 ---
@@ -99,15 +101,38 @@ python3 network_monitor.py
 ```
 
 ```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🌐  Network Monitor  —  4 target(s)
+  🔌  Interfaces:  WiFi (en0)  +  Ethernet (en1)
+  ⏱   Interval: 5s   Pings/cycle: 4
+  🖥   Output mode: quiet    (hourly summary)
+  📄  CSV: /path/to/network_health_20260518_143000.csv
+  Press Ctrl+C to stop
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+The script then runs silently. On the hour (and on Ctrl+C) it prints one block **grouped by interface** — this is where you see WiFi vs Ethernet at a glance:
+
+```
 ────────────────────────────────────────────────────────────────────────
   HOURLY SUMMARY   2026-05-18 14:00 → 15:00
 ────────────────────────────────────────────────────────────────────────
-  ✅ 8.8.8.8              uptime=100.0%  avg=11.4ms   max=22.1ms   drops=0     [WiFi (en0)]
-  ✅ apple.com            uptime=100.0%  avg=19.8ms   max=31.4ms   drops=0     [WiFi (en0)]
-  ✅ 75.75.75.75          uptime=100.0%  avg=13.9ms   max=24.6ms   drops=0     [WiFi (en0)]
-  ❌ 75.75.76.76          uptime= 70.0%  avg=15.2ms   max=25.2ms   drops=144   worst_streak=6  [WiFi (en0)]
+
+  WiFi (en0)
+  ✅ 8.8.8.8              uptime=100.0%  avg=11.4ms   max=22.1ms   drops=0
+  ✅ apple.com            uptime=100.0%  avg=19.8ms   max=31.4ms   drops=0
+  ✅ 75.75.75.75          uptime=100.0%  avg=13.9ms   max=24.6ms   drops=0
+  ❌ 75.75.76.76          uptime= 70.0%  avg=15.2ms   max=25.2ms   drops=144   worst_streak=6
+
+  Ethernet (en1)
+  ✅ 8.8.8.8              uptime=100.0%  avg=9.1ms    max=18.3ms   drops=0
+  ✅ apple.com            uptime=100.0%  avg=17.2ms   max=28.1ms   drops=0
+  ✅ 75.75.75.75          uptime=100.0%  avg=11.8ms   max=22.4ms   drops=0
+  ✅ 75.75.76.76          uptime=100.0%  avg=10.3ms   max=21.6ms   drops=0
 ────────────────────────────────────────────────────────────────────────
 ```
+
+Same target, same hour — WiFi drops while Ethernet stays clean. **Wireless problem confirmed.**
 
 **Pressing Ctrl+C** flushes the current partial hour before printing the
 all-time session summary, so you never lose data.
@@ -123,11 +148,17 @@ python3 network_monitor.py -v
 ```
 
 ```
-  ✅ 8.8.8.8              avg=11.8ms   loss=  0.0%  roll=  0.0%  fail=0   http=SKIP
-  ✅ apple.com            avg=19.5ms   loss=  0.0%  roll=  0.0%  fail=0   http=200   jitter=1.2ms
-  ✅ 75.75.75.75          avg=14.2ms   loss=  0.0%  roll=  0.0%  fail=0   http=SKIP
-  ❌ 75.75.76.76          avg=     —   loss=100.0%  roll= 30.0%  fail=3   http=SKIP
-  [2026-05-18T14:30:45]  iface=WiFi (en0)  cycle=4.83s
+  ✅ WiFi (en0)       8.8.8.8              avg=11.8ms   loss=  0.0%  roll=  0.0%  fail=0
+  ✅ WiFi (en0)       apple.com            avg=19.5ms   loss=  0.0%  roll=  0.0%  fail=0   jitter=1.2ms
+  ✅ WiFi (en0)       75.75.75.75          avg=14.2ms   loss=  0.0%  roll=  0.0%  fail=0
+  ❌ WiFi (en0)       75.75.76.76          avg=     —   loss=100.0%  roll= 30.0%  fail=3
+
+  ✅ Ethernet (en1)   8.8.8.8              avg=9.4ms    loss=  0.0%  roll=  0.0%  fail=0
+  ✅ Ethernet (en1)   apple.com            avg=17.1ms   loss=  0.0%  roll=  0.0%  fail=0   jitter=0.9ms
+  ✅ Ethernet (en1)   75.75.75.75          avg=12.0ms   loss=  0.0%  roll=  0.0%  fail=0
+  ✅ Ethernet (en1)   75.75.76.76          avg=10.8ms   loss=  0.0%  roll=  0.0%  fail=0
+
+  [2026-05-18T14:30:45]  cycle=9.81s
 ```
 
 ---
@@ -168,7 +199,7 @@ nohup python3 network_monitor.py -q > monitor.log 2>&1 &
 | `ping_status` | string | `ok` / `partial` / `timeout` / `error` |
 | `http_status_code` | string | HTTP HEAD response code, `SKIP`, `ERROR`, or `TIMEOUT` |
 | `http_latency_ms` | float | Time to first HTTP byte in ms |
-| `interface` | string | `WiFi (en0)`, `Ethernet (en1)`, etc. |
+| `interface` | string | `WiFi (en0)` or `Ethernet (en1)` — identifies which physical path was used. With `MONITOR_ALL_INTERFACES = True` every cycle produces **two rows per target**, one per active interface |
 
 > **Blank cells** in latency columns mean the ping produced no response —
 > there is nothing to measure. This is distinct from a 0 ms value.
@@ -191,16 +222,15 @@ Numbers will import the CSV and display it as a table.
 
 ### Step 2 — Filter to one target
 
-Because all targets are interleaved row-by-row, you should filter to a single
-target before charting so the lines are clean.
+Because all targets **and both interfaces** are interleaved row-by-row, filter down to one target and one interface before charting.
 
 1. Click the **filter icon** (funnel) in the top-right of the table, or go to
    **Format** (right panel) → **Table** → **Filter**
-2. Click **Add a Filter**
-3. Choose column: **target** → **is** → type the target name, e.g. `75.75.76.76`
+2. Click **Add a Filter** → column: **target** → **is** → e.g. `75.75.76.76`
+3. Click **Add a Filter** again → column: **interface** → **is** → e.g. `WiFi (en0)`
 4. Numbers hides all other rows instantly
 
-Repeat with a different filter to compare targets.
+To compare the same target across both interfaces, duplicate the sheet and change the interface filter on the copy.
 
 ---
 
@@ -326,7 +356,7 @@ Use the CSV columns to answer these questions:
 
 | Question | How to answer |
 |---|---|
-| **WiFi or Ethernet?** | Filter `interface` column — drops only on `WiFi` = wireless problem |
+| **WiFi or Ethernet?** | With dual-interface monitoring the answer is in the CSV directly: find a drop row, compare `interface = WiFi (en0)` showing `timeout` against `interface = Ethernet (en1)` showing `ok` at the **same timestamp** — wireless confirmed |
 | **All targets or just one?** | If `8.8.8.8`, `apple.com`, and Comcast DNS all drop at the same timestamp → your router/modem lost the connection |
 | **DNS or routing?** | `dns_resolve_ms` spikes but `ping_avg_ms` is normal → DNS issue only |
 | **Network or service?** | `ping_status = ok` but `http_status_code = ERROR` on the same row → the service is down, not your network |
@@ -388,6 +418,6 @@ launchctl load ~/Library/LaunchAgents/com.local.networkmonitor.plist
 
 | File | Created | Description |
 |---|---|---|
-| `network_health_YYYYMMDD_HHmmss.csv` | On start | Main data log — one row per target per cycle |
+| `network_health_YYYYMMDD_HHmmss.csv` | On start | Main data log — two rows per target per cycle (one per interface) when `MONITOR_ALL_INTERFACES = True` |
 | `traceroute_<target>_<timestamp>.txt` | On first failure | Path snapshot showing where packets stop |
 | `monitor.log` | If using `nohup` | Terminal output (hourly summaries + alerts) |

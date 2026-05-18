@@ -28,8 +28,6 @@ Usage
   3. Press Ctrl+C to stop — summary is printed and CSV path is shown.
 """
 
-from __future__ import annotations
-
 import argparse
 import csv
 import datetime
